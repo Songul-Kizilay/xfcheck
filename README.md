@@ -37,7 +37,7 @@ Bu, özellikle şu zafiyetlerde işe yarar:
 
 ## 🚀 Kurulum
 
-git clone https://github.com/Songul-Kizilay/xfcheck-.git
+git clone [https://github.com/Songul-Kizilay/xfcheck-.git](https://github.com/Songul-Kizilay/xfcheck.git)
 cd xfcheck
 chmod +x xfcheck.py
 
