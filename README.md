@@ -104,5 +104,5 @@ Geri kalan değerlendirme pentest aşamasına kalır 🙂
 
 ## ✨ Yapan
 
-**Songül Kızılay**  
+**Songül Kızılay Özügürler**  
 Security Researcher / Pentester
