@@ -1,204 +1,141 @@
-# 🔥 X-Override Scanner — Advanced URL Override & Admin Bypass Detector
+:
 
-X-Override Scanner, modern web uygulamalarında görülen **URL override / header-based access control bypass** zafiyetlerini tespit etmek için geliştirilmiş gelişmiş bir güvenlik aracıdır.
+🔥 X-Override Scanner
+Advanced URL Override & Admin Bypass Detector
 
-Bu araç özellikle şu zafiyetleri tespit eder:
+X-Override Scanner, web uygulamalarında yanlış yapılandırılmış URL override header’ları kullanılarak oluşan kritik erişim kontrol zafiyetlerini tespit eden gelişmiş bir güvenlik aracıdır.
 
-- `X-Original-URL`
-- `X-Rewrite-URL`
-- `X-Original-URI`
-- `X-Forwarded-For`
-- `X-Forwarded-Host`
-- `X-HTTP-Method-Override`
+Araç şu override headerlarını destekler:
 
-ve benzeri HTTP header'larının **sunucu tarafından yanlış yorumlanması** sonucu oluşan:
+X-Original-URL
 
-🔹 **Broken Access Control**  
-🔹 **Admin panel bypass**  
-🔹 **Front-end → Back-end URL inconsistency**  
-🔹 **403 bypass**  
-🔹 **Unprotected admin functionality**
+X-Rewrite-URL
 
-gibi kritik güvenlik açıklarını otomatik olarak tespit eder.
+X-Original-URI
 
----
+X-Forwarded-Host
 
-## 🚀 Özellikler
+X-Forwarded-Proto
 
-### ✔ URL Override Detection
-Uygulamanın hangi override header’larını desteklediğini otomatik olarak belirler.
+X-Forwarded-For
 
-### ✔ SecLists destekli admin path brute-force (Optimize)
-`/usr/share/seclists/Discovery/Web-Content/` dizinindeki wordlistlerde:
+X-HTTP-Method-Override
 
-- admin  
-- panel  
-- dashboard  
-- root  
-- manage  
-- private  
-- console  
-- login  
+Bu zafiyetler genellikle şu güvenlik açıklarına yol açar:
 
-gibi **anahtar kelime filtrelemesi** yaparak gereksiz girişleri eler ve sadece gerçek admin path'lerini test eder.
+Admin panel bypass
 
-### ✔ GET & POST Bağımsız Analiz
-Hem GET hem POST isteklerinde override denemesi yapılır.
+403 bypass
 
-### ✔ Otomatik PortSwigger Login (Opsiyonel)
-`--auto-login` seçeneği ile PortSwigger labları için otomatik giriş yapılır:
+Broken Access Control
 
-- username: **wiener**
-- password: **peter**
-- CSRF token otomatik çekilir.
+Front-end vs Back-end URL mismatch
 
-### ✔ Otomatik Exploit Modu (Opsiyonel)
-`--auto-exploit` aktif olduğunda araç, override bypass tespitinde otomatik:
+Unprotected admin functionality
+
+🚀 Özellikler
+✔ URL Override Detection
+
+Sunucunun hangi override header’larını desteklediğini otomatik olarak analiz eder.
+
+✔ SecLists Destekli Admin Path Brute-Force
+
+/usr/share/seclists/Discovery/Web-Content/ içindeki admin/directory listeleri otomatik taranır.
+
+✔ GET & POST Analizi
+
+Her iki yöntem üzerinde override testleri yapılır.
+
+✔ PortSwigger Auto-Login (Opsiyonel)
+
+--auto-login ile wiener/peter kullanıcı bilgisi ve CSRF token otomasyonuyla lab girişleri yapılır.
+
+✔ PortSwigger Auto-Exploit
+
+--auto-exploit aktif olduğunda araç bypass başarılıysa şu isteği göndererek labı otomatik çözer:
 
 /admin/delete?username=carlos
 
-shell
-Kodu kopyala
+✔ Redirect Chain Analizi
 
-gibi istekleri göndererek **PortSwigger lablarını otomatik çözer**.
+--follow ile 301/302 zinciri takip edilir ve farklılıklar raporlanır.
 
-### ✔ Redirect Chain Analizi
-`--follow` ile 301/302 zincirleri takip edilir ve karşılaştırılır.
+✔ JSON / CSV Çıktı
 
-### ✔ JSON / CSV Çıktı
-Raporlama ve SIEM entegrasyonu için uygundur.
+Pentest raporlaması ve SIEM entegrasyonları için idealdir.
 
-### ✔ Proxy Destekli
+✔ Proxy Destekli
+
 Burp Suite üzerinden çalıştırmak için:
 
 export HTTPS_PROXY=http://127.0.0.1:8080
 
-yaml
-Kodu kopyala
-
----
-
-## 📦 Kurulum
-
-### Gerekli Paketler
-
+📦 Kurulum
+Gereksinimler
 pip install aiohttp certifi
 
-yaml
-Kodu kopyala
 
-Aracı çalıştırmadan önce Python 3.9+ kullanmanız önerilir.
+Python 3.9+ kullanmanız tavsiye edilir.
 
----
-
-## 🔧 Kullanım
-
-### Basit tarama
-
+🔧 Kullanım
+Basit tarama
 python3 x_override_full_exploit.py -u https://example.com
 
-shell
-Kodu kopyala
-
-### Derin tarama + SecLists brute-force
-
+Derin tarama + SecLists brute-force
 python3 x_override_full_exploit.py -u https://target.com --deep
 
-shell
-Kodu kopyala
-
-### Redirect zincirlerini takip et
-
+Redirect zincirlerini takip et
 python3 x_override_full_exploit.py -u https://target.com --follow
 
-graphql
-Kodu kopyala
-
-### PortSwigger otomatik login + auto exploit
-
-python3 x_override_full_exploit.py -u https://example.web-security-academy.net
+PortSwigger otomatik login + otomatik exploit
+python3 x_override_full_exploit.py -u https://example.web-security-academy.net \
 --auto-login --auto-exploit --deep --follow
 
-shell
-Kodu kopyala
-
-### Sonuçları kayıt et
-
-python3 x_override_full_exploit.py -u https://target.com
+Sonuçları JSON/CSV olarak kaydet
+python3 x_override_full_exploit.py -u https://target.com \
 --output findings.json --csv findings.csv
 
-shell
-Kodu kopyala
-
-### Cookie ile çalıştırmak
-
+Cookie ekleyerek çalıştır
 python3 x_override_full_exploit.py -u https://target.com --cookie "session=abc123;"
 
-shell
-Kodu kopyala
-
-### POST desteği
-
-python3 x_override_full_exploit.py -u https://target.com/login
+POST isteği ile çalıştır
+python3 x_override_full_exploit.py -u https://target.com/login \
 --post-data "username=test&password=1234&csrf=XYZ"
 
-yaml
-Kodu kopyala
-
----
-
-## 📂 Örnek Çıktı
-
+📂 Örnek Çıktı
 [X-Original-URL] GET → /admin => 200 | len=1234
 [HIGH] status changed 403 → 200
 - admin keywords found in response
 - redirect chain differs
 
-yaml
-Kodu kopyala
-
----
-
-## ⚠️ Yasal Uyarı
+⚠️ Yasal Uyarı
 
 Bu araç yalnızca:
 
-- kendi sistemlerinizde  
-- izinli güvenlik testlerinde  
-- PortSwigger lablarında  
+kendi sistemlerinizde
 
-kullanılmak üzere tasarlanmıştır.
+izinli güvenlik testlerinde
 
-İzinsiz tarama yapmak **yasadışıdır** ve ciddi hukuki sonuçlar doğurabilir.
+PortSwigger lablarında
 
-Geliştirici (sen ve repo sahibi) yapılan kötüye kullanımdan **sorumlu değildir**.
+kullanılmak için tasarlanmıştır.
 
----
+İzinsiz tarama yasadışıdır ve hukuki sonuçlar doğurabilir.
 
-## 🤝 Katkıda Bulunma
+Geliştirici (Songül Kızılay) kötüye kullanımdan sorumlu değildir.
 
-Pull request'ler açıktır.  
-Yeni override header'ları veya yeni exploit modülleri eklemek istiyorsanız PR gönderebilirsiniz.
+🤝 Katkıda Bulunma
 
----
+Pull request’ler açıktır.
+Yeni override headerları veya exploit modülleri eklemek isteyen herkes katkıda bulunabilir.
 
-## ⭐ Destek
+⭐ Destek
 
-Eğer araç işinize yaradıysa lütfen ⭐ vererek destek olun!  
-Dilerseniz:
+Eğer araç işinize yaradıysa ⭐ vermeyi unutmayın!
+Blog yazısı, PoC videosu veya eğitim içeriklerinde paylaşabilirsiniz.
 
-- Blog yazısı  
-- PoC videosu  
-- Eğitim serisi  
+👩‍💻 Geliştiren
 
-kısaca paylaşabilirsiniz.
-
----
-
-## 👩‍💻 Geliştiren
-
-**Songül Kızılay**
-
-Siber güvenlik / Pentest / Red Team odaklı güvenlik araştırmacısı.  
-PortSwigger + Web Security + Blue/Red Team konularında aktif üretici.
-
+Songül Kızılay
+Siber Güvenlik • Pentest • Red Team
+PortSwigger + Web Security araştırmacısı
