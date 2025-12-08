@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-xoverride_single.py
+scan.py - WAF-aware X-Override scanner (single-file)
 
-Single-file modular X-Override scanner (class-based), optimized for low false-positives.
-Usage:
-  python3 xoverride_single.py -u example.com [--deep] [--post-data "u=p&p=q"] [--cookie "session=..."] [--max 500] [--insecure]
+Usage examples:
+  python3 scan.py -u https://example.com
+  python3 scan.py -u example.com --deep --post-data "username=wiener&password=peter&csrf=XYZ" --cookie "session=abc" --insecure
+  python3 scan.py -u https://target --deep --max 300
 
-Note: Use only on authorized targets (labs / your infrastructure).
+Notes:
+ - Use only on authorized targets (labs / your infra).
+ - Requires: requests
+     pip install requests
 """
 import argparse
 import requests
@@ -21,7 +25,7 @@ from collections import defaultdict
 from pathlib import Path
 import time
 
-# ------------------ Config ------------------
+# ---------------- Config ----------------
 SECLISTS_DIR_DEFAULT = "/usr/share/seclists/Discovery/Web-Content"
 HEADER_VARIANTS = [
     "X-Original-URL","X-Original-Url","X-Original-URI","X-Original-Uri",
@@ -29,16 +33,27 @@ HEADER_VARIANTS = [
     "X-Forwarded-Host","X-Forwarded-For","X-Forwarded-Proto",
     "X-HTTP-Method-Override","X-Requested-With"
 ]
-ADMIN_KEYWORDS = ["admin","administrator","panel","dashboard","manage","delete","settings","login","user","users","csrf","token"]
+ADMIN_KEYWORDS = ["admin","administrator","panel","dashboard","manage","delete","settings","login","user","users","csrf","token","adminer"]
 DEFAULT_BASELINE_PATHS = ["/", "/index", "/home", "/login"]
 DEFAULT_OVERRIDE_TARGETS = ["/admin","/admin/delete","/admin/delete?username=test"]
 
 # thresholds
-SIMILARITY_THRESHOLD = 0.85   # if candidate similar to baseline > this -> likely same page
-ADMIN_KEYWORD_COUNT_THRESHOLD = 2  # number of admin keywords required to consider admin page
+SIMILARITY_THRESHOLD = 0.85   # candidate similar to baseline if > this
+ADMIN_KEYWORD_COUNT_THRESHOLD = 2
 LEN_DIFF_MIN = 50  # minimal body length diff to consider significant
 
-# ------------------ Utilities ------------------
+# WAF detection heuristics
+WAF_TITLE_PATTERNS = [
+    "request rejected", "access denied", "forbidden", "blocked", "request blocked",
+    "security warning", "access denied -", "this request has been blocked", "access denied"
+]
+WAF_BODY_PATTERNS = [
+    "request rejected", "access denied", "blocked by", "cloudflare", "incapsula", "waf", "ddos-guard",
+    "suspicious request", "malformed request"
+]
+WAF_MAX_LEN = 800  # typically WAF block pages small
+
+# ---------------- Utilities ----------------
 def normalize_path(p):
     if not p: return None
     p = p.strip()
@@ -58,7 +73,7 @@ def extract_title(html):
         return ""
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
     if m:
-        return m.group(1).strip()
+        return re.sub(r"\s+", " ", m.group(1)).strip()
     return ""
 
 def sha256(text):
@@ -72,30 +87,43 @@ def short_snippet(text, n=200):
     if not text: return ""
     return re.sub(r"\s+", " ", text)[:n]
 
-# ------------------ Classes ------------------
+def looks_like_waf(title, body, status, length):
+    t = (title or "").lower()
+    b = (body or "").lower()
+    # title patterns
+    if any(p in t for p in WAF_TITLE_PATTERNS):
+        return True, "title pattern"
+    # body short + pattern
+    if length > 0 and length <= WAF_MAX_LEN and any(p in b for p in WAF_BODY_PATTERNS):
+        return True, "short body pattern"
+    # status-based heuristic
+    if status in (400, 403, 406) and length <= WAF_MAX_LEN:
+        return True, "status small-body heuristic"
+    # explicit messages
+    if "request rejected" in b or "access denied" in b:
+        return True, "explicit string"
+    return False, None
 
+# ---------------- Classes ----------------
 class Requester:
     def __init__(self, verify=True, timeout=8, proxies=None):
         self.session = requests.Session()
         self.session.verify = verify
-        self.session.headers.update({"User-Agent":"XOverrideSingle/1.0"})
+        self.session.headers.update({"User-Agent":"XOverrideScanner/1.0"})
         self.timeout = timeout
         if proxies:
             self.session.proxies.update(proxies)
-        # requests by default uses env proxies; trust_env True uses them
         self.session.trust_env = True
 
     def get(self, url, headers=None, allow_redirects=False):
         try:
-            r = self.session.get(url, headers=headers, allow_redirects=allow_redirects, timeout=self.timeout)
-            return r
-        except requests.RequestException as e:
+            return self.session.get(url, headers=headers, allow_redirects=allow_redirects, timeout=self.timeout)
+        except requests.RequestException:
             return None
 
     def post(self, url, headers=None, data=None, allow_redirects=False):
         try:
-            r = self.session.post(url, headers=headers, data=data, allow_redirects=allow_redirects, timeout=self.timeout)
-            return r
+            return self.session.post(url, headers=headers, data=data, allow_redirects=allow_redirects, timeout=self.timeout)
         except requests.RequestException:
             return None
 
@@ -106,7 +134,7 @@ class SecListsLoader:
         self.paths = []
 
     def discover(self, max_paths=2000):
-        out = []
+        out=[]
         if not os.path.isdir(self.base_dir):
             return out
         for root, dirs, files in os.walk(self.base_dir):
@@ -124,7 +152,6 @@ class SecListsLoader:
                                 out.append(p)
                 except Exception:
                     continue
-        # deduplicate preserving order
         seen=set(); clean=[]
         for p in out:
             if p not in seen:
@@ -137,18 +164,14 @@ class SecListsLoader:
 
 class Analyzer:
     def __init__(self, baseline_map):
-        """
-        baseline_map: dict[path] = {"len":..., "hash":..., "title":..., "text":...}
-        """
         self.baseline = baseline_map or {}
 
     def fingerprint_match(self, candidate_text):
-        """Compare candidate against all baseline fingerprints. Return (matched_path, similarity) or (None,0)"""
-        best = (None, 0.0)
+        best=(None,0.0)
         for p,b in self.baseline.items():
             sim = similarity(candidate_text or "", b.get("text","") or "")
             if sim > best[1]:
-                best = (p, sim)
+                best=(p,sim)
         return best
 
     def is_admin_like(self, text):
@@ -162,28 +185,28 @@ class Analyzer:
         return (len(found) >= ADMIN_KEYWORD_COUNT_THRESHOLD), len(found), found
 
     def analyze(self, baseline_resp, candidate_resp):
-        """
-        baseline_resp and candidate_resp are requests.Response objects (or None).
-        Returns dict: {interesting:bool, reasons:[...], severity: 'LOW'|'MEDIUM'|'HIGH'}
-        """
         reasons=[]
         severity="LOW"
         if candidate_resp is None:
-            return {"interesting":False, "reasons":["no candidate response"], "severity":severity}
+            return {"interesting":False, "reasons":["no candidate response"], "severity":severity, "waf":False}
 
         c_status = candidate_resp.status_code
-        c_text = candidate_resp.text if candidate_resp.text else ""
-        c_len = len(candidate_resp.content) if candidate_resp.content else 0
+        c_text = candidate_resp.text or ""
+        c_len = len(candidate_resp.content or b"")
         c_title = extract_title(c_text)
+
+        # WAF detection early
+        is_waf, why = looks_like_waf(c_title, c_text, c_status, c_len)
+        if is_waf:
+            return {"interesting":False, "reasons":[f"waf detected: {why}"], "severity":"LOW", "waf":True}
 
         if baseline_resp is None:
             reasons.append("no baseline - candidate responded")
             severity="MEDIUM"
-            # then further checks
         else:
             b_status = baseline_resp.status_code
-            b_text = baseline_resp.text if baseline_resp.text else ""
-            b_len = len(baseline_resp.content) if baseline_resp.content else 0
+            b_text = baseline_resp.text or ""
+            b_len = len(baseline_resp.content or b"")
             b_title = extract_title(b_text)
 
             # status change
@@ -194,71 +217,61 @@ class Analyzer:
                 else:
                     severity = "MEDIUM" if severity!="HIGH" else severity
 
-            # title difference
+            # title diff
             if b_title and c_title and b_title.strip().lower() != c_title.strip().lower():
                 reasons.append(f"title changed: '{b_title}' -> '{c_title}'")
                 severity = "MEDIUM" if severity!="HIGH" else severity
 
-            # body length difference
+            # length diff
             if abs(b_len - c_len) > max(LEN_DIFF_MIN, b_len//10 if b_len>0 else LEN_DIFF_MIN):
                 reasons.append(f"body length changed ({b_len} -> {c_len})")
                 severity = "MEDIUM" if severity!="HIGH" else severity
 
-        # fingerprint (similarity to baseline)
+        # fingerprint
         matched_path, sim = self.fingerprint_match(c_text)
         if matched_path and sim >= SIMILARITY_THRESHOLD:
-            reasons.append(f"response very similar to baseline '{matched_path}' (sim={sim:.2f})")
-            # similarity to baseline implies likely same page => reduce severity
-            # if earlier high severity flagged, keep it but mark as suspicious
+            reasons.append(f"response similar to baseline '{matched_path}' (sim={sim:.2f})")
+            # similarity suggests fallback; reduce severity unless admin-like keywords present
             if severity != "HIGH":
                 severity = "LOW"
-        # admin-like detection
+
+        # admin detection
         admin_like, count, found = self.is_admin_like(c_text)
         if admin_like:
             reasons.append(f"admin-like keywords found: {found}")
-            # if similarity says same as baseline then don't bump high
-            if severity=="LOW":
-                severity="HIGH"
-            elif severity=="MEDIUM":
+            if severity in ("LOW","MEDIUM"):
                 severity="HIGH"
 
-        # redirect chain check
-        # requests.Response.history is a list of Response objects if allow_redirects True
-        # But we normally used allow_redirects=False; still candidate_resp might have .headers['Location']
-        if 'Location' in candidate_resp.headers:
-            reasons.append(f"Location header in candidate: {candidate_resp.headers.get('Location')}")
-            severity = "MEDIUM" if severity!="HIGH" else severity
+        # Location header check
+        loc = candidate_resp.headers.get("Location")
+        if loc:
+            reasons.append(f"Location header in candidate: {loc}")
+            if severity!="HIGH":
+                severity="MEDIUM"
 
-        interesting = any([
-            ("status changed" in r) or ("admin-like" in r) or ("admin-like" in r)
-            for r in reasons
-        ]) or admin_like
-
-        # Final rule: require at least two independent signals to mark HIGH:
-        # signals: status_change, title_change, admin_keywords, body_len_change, location_change, not-similar-to-baseline
-        signals = 0
-        if any("status changed" in r for r in reasons): signals += 1
-        if any(r.startswith("title changed") for r in reasons): signals += 1
-        if admin_like: signals += 1
-        if any("body length changed" in r for r in reasons): signals += 1
-        if any(r.startswith("Location header") for r in reasons) or any("Location changed" in r for r in reasons): signals += 1
-        # not similar to baseline:
+        # signals scoring
+        signals=0
+        if any("status changed" in r for r in reasons): signals+=1
+        if any(r.startswith("title changed") for r in reasons): signals+=1
+        if admin_like: signals+=1
+        if any("body length changed" in r for r in reasons): signals+=1
+        if loc: signals+=1
+        # not similar to baseline counts
         if not (matched_path and sim >= SIMILARITY_THRESHOLD):
-            signals += 1
+            signals+=1
 
-        # determine final severity
         if signals >= 3:
-            final_sev = "HIGH"
-        elif signals == 2:
-            final_sev = "MEDIUM"
+            final_sev="HIGH"
+        elif signals==2:
+            final_sev="MEDIUM"
         else:
-            final_sev = "LOW"
+            final_sev="LOW"
 
-        # but if matched similarity to baseline strongly and no admin keywords, mark not interesting
+        # final override: if highly similar to baseline and no admin keywords -> not interesting
         if matched_path and sim >= SIMILARITY_THRESHOLD and not admin_like and final_sev!="HIGH":
-            return {"interesting": False, "reasons": ["response matches baseline closely; likely fallback"], "severity": "LOW"}
+            return {"interesting":False, "reasons":["response matches baseline; likely fallback"], "severity":"LOW", "waf":False}
 
-        return {"interesting": True if final_sev!="LOW" else False, "reasons": reasons, "severity": final_sev}
+        return {"interesting": True if final_sev!="LOW" else False, "reasons":reasons, "severity":final_sev, "waf":False}
 
 class Scanner:
     def __init__(self, target, post_data=None, cookie=None, insecure=False, deep=False, max_paths=200, timeout=8):
@@ -266,7 +279,7 @@ class Scanner:
         if not (target.startswith("http://") or target.startswith("https://")):
             self.target_candidates = ["https://" + target, "http://" + target]
         else:
-            self.target_candidates = [target]
+            self.target_candidates = [target.rstrip("/")]
         self.post_data = post_data
         self.cookie = cookie
         self.verify = not insecure
@@ -282,13 +295,11 @@ class Scanner:
         self.headers_to_try = HEADER_VARIANTS
 
     def build_override_list(self):
-        # extend override targets with sec lists (if deep)
         if self.deep:
             secl = self.secloader.discover(max_paths=self.max_paths*5)
             for p in secl:
                 if p not in self.override_targets:
                     self.override_targets.append(p)
-        # ensure normalized and unique
         norm=[]
         for p in self.override_targets:
             n = normalize_path(p)
@@ -306,10 +317,9 @@ class Scanner:
             r = self.req.get(url, headers=headers, allow_redirects=False)
             if r is None:
                 continue
-            self.baseline_map[p] = {"len": len(r.content or b""), "hash": sha256(r.text or ""), "title": extract_title(r.text or ""), "text": r.text or ""}
+            self.baseline_map[p] = {"len": len(r.content or b""), "hash": sha256(r.text or ""), "title": extract_title(r.text or ""), "text": r.text or "", "status": r.status_code}
             print(f"  baseline {p} -> status {r.status_code} len {len(r.content or b'')}")
-        # build analyzer
-        self.analyzer = Analyzer(self.baseline_map)
+        self.analyzer = Analyzer({k:v for k,v in self.baseline_map.items()})
 
     def run_once(self, base_url):
         self.build_override_list()
@@ -317,8 +327,7 @@ class Scanner:
         headers = {}
         if self.cookie: headers["Cookie"]=self.cookie
 
-        # Use user-provided post_data to enable POST tests
-        test_paths = ["/", "/login"]  # baseline paths to test overrides on
+        test_paths = ["/", "/login"]
         for path in test_paths:
             target_url = urljoin(base_url, path.lstrip("/"))
             print(f"\n== Testing baseline path {path} on {base_url} ==")
@@ -327,21 +336,21 @@ class Scanner:
             if self.post_data:
                 base_post = self.req.post(target_url, headers=headers, data=self.post_data, allow_redirects=False)
 
-            # iterate override headers and override targets
             for header in self.headers_to_try:
                 for override in self.override_targets:
-                    # skip identity
                     override_norm = normalize_path(override)
                     hdrs = dict(headers)
                     hdrs[header] = override_norm
                     # GET
                     rget = self.req.get(target_url, headers=hdrs, allow_redirects=False)
-                    # analyze
                     res = self.analyzer.analyze(base_get, rget)
+                    # if WAF detected, ignore
+                    if res.get("waf"):
+                        # optional: could record counts, but skip noisy results
+                        continue
                     key = (header, "GET", override_norm, path)
                     if res.get("interesting"):
-                        # dedup
-                        keyid = "|".join(map(str,key))
+                        keyid="|".join(map(str,key))
                         if keyid not in self.seen_findings:
                             self.seen_findings.add(keyid)
                             self.findings.append({"header":header,"method":"GET","override":override_norm,"path":path,"severity":res["severity"],"reasons":res["reasons"],"candidate_len": (len(rget.content) if rget and rget.content else 0),"candidate_title": extract_title(rget.text if rget else "")})
@@ -349,9 +358,11 @@ class Scanner:
                     if self.post_data:
                         rpost = self.req.post(target_url, headers=hdrs, data=self.post_data, allow_redirects=False)
                         res2 = self.analyzer.analyze(base_post, rpost)
+                        if res2.get("waf"):
+                            continue
                         key2 = (header, "POST", override_norm, path)
                         if res2.get("interesting"):
-                            keyid2 = "|".join(map(str,key2))
+                            keyid2="|".join(map(str,key2))
                             if keyid2 not in self.seen_findings:
                                 self.seen_findings.add(keyid2)
                                 self.findings.append({"header":header,"method":"POST","override":override_norm,"path":path,"severity":res2["severity"],"reasons":res2["reasons"],"candidate_len": (len(rpost.content) if rpost and rpost.content else 0),"candidate_title": extract_title(rpost.text if rpost else "")})
@@ -359,51 +370,45 @@ class Scanner:
     def run(self):
         for base in self.target_candidates:
             print(f"\n== Testing base: {base} ==")
-            # quick reachability check
             r = self.req.get(base, headers=None, allow_redirects=False)
             if r is None:
                 print("  [!] Base not reachable:", base)
                 continue
-            # prepare override list
             self.build_override_list()
-            # run once per base
             self.run_once(base)
-        # print summary
         print("\n[+] Scan complete. Findings:", len(self.findings))
+        if not self.findings:
+            print("  No backend-level override behavior detected (WAF-blocks filtered).")
         for f in self.findings:
-            sev_col = f["severity"]
-            print(f"[{sev_col}] {f['header']} {f['method']} -> {f['override']} on {f['path']}")
+            sev = f["severity"]
+            print(f"[{sev}] {f['header']} {f['method']} -> {f['override']} on {f['path']}")
             for r in f["reasons"]:
                 print("   -", r)
+            print(f"   candidate_len: {f.get('candidate_len')} title: {f.get('candidate_title')}")
 
-# ------------------ CLI ------------------
+# ---------------- CLI ----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="X-Override single-file modular scanner (low false positives). Use only on authorized targets.")
-    p.add_argument("-u","--url", required=True, help="Target host or base url (example.com or https://example.com)")
+    p = argparse.ArgumentParser(description="WAF-aware X-Override scanner (single-file). Use only on authorized targets.")
+    p.add_argument("-u","--url", required=True, help="Target host or base URL (example.com or https://example.com)")
     p.add_argument("--deep", action="store_true", help="Enable SecLists deep mode (optimized filter)")
-    p.add_argument("--post-data", help="POST body to use (enable POST tests)")
-    p.add_argument("--cookie", help="Cookie header to include")
-    p.add_argument("--insecure", action="store_true", help="Disable TLS verification")
+    p.add_argument("--post-data", dest="post_data", help="POST body to use (enable POST tests)")
+    p.add_argument("--cookie", help="Cookie header value to include")
+    p.add_argument("--insecure", action="store_true", help="Disable TLS verify")
     p.add_argument("--max", type=int, default=300, help="Max SecLists paths to load (optimized)")
     p.add_argument("--timeout", type=int, default=8, help="Request timeout seconds")
     return p.parse_args()
 
 def main():
     args = parse_args()
-    # normalize
-    target = args.url
-    # create scanner
-    sc = Scanner(target, post_data=args.post_data, cookie=args.cookie, insecure=args.insecure, deep=args.deep, max_paths=args.max, timeout=args.timeout)
-    # set seclists dir to default or env override
+    sc = Scanner(args.url, post_data=args.post_data, cookie=args.cookie, insecure=args.insecure, deep=args.deep, max_paths=args.max, timeout=args.timeout)
+    # if deep and default seclists not present, try common alt
     if args.deep:
-        loader = sc.secloader
         if os.path.isdir(SECLISTS_DIR_DEFAULT):
-            loader.base_dir = SECLISTS_DIR_DEFAULT
+            sc.secloader.base_dir = SECLISTS_DIR_DEFAULT
         else:
-            # try common alternatives
             alt = "/usr/share/wordlists/seclists/Discovery/Web-Content"
             if os.path.isdir(alt):
-                loader.base_dir = alt
+                sc.secloader.base_dir = alt
     sc.run()
 
 if __name__ == "__main__":
