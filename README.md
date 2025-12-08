@@ -1,6 +1,4 @@
-:
-
-🔥 X-Override Scanner
+ X-Override Scanner
 Advanced URL Override & Admin Bypass Detector
 
 X-Override Scanner, web uygulamalarında yanlış yapılandırılmış URL override header’ları kullanılarak oluşan kritik erişim kontrol zafiyetlerini tespit eden gelişmiş bir güvenlik aracıdır.
