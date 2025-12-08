@@ -1,110 +1,57 @@
-# xfcheck — X‑Forwarded Header Checker
+# 🔥 X-Override Scanner — Advanced URL Override & Admin Bypass Detector
 
-Kendi çalışmalarımda sürekli ihtiyaç duyduğum bir şeydi:  
-Bir hedef URL **X‑Forwarded‑For** ve **X‑Forwarded‑Host** header’larını gerçekten işliyor mu, bunu hızlıca test etmek.
+X-Override Scanner, modern web uygulamalarında görülen **URL override / header-based access control bypass** zafiyetlerini tespit etmek için geliştirilmiş gelişmiş bir güvenlik aracıdır.
 
-Bazı uygulamalar bu header’lara göre:
-- IP doğrulaması yapıyor,
-- admin panel erişimini kontrol ediyor,
-- password‑reset linki oluştururken Host yapısını kullanıyor,
-- backend tarafında farklı davranışa geçiyor.
+Bu araç özellikle şu zafiyetleri tespit eder:
 
-Ben de oturdum, bunun hızlıca tespitini yapan küçük bir Python aracı yazdım.
+- `X-Original-URL`
+- `X-Rewrite-URL`
+- `X-Original-URI`
+- `X-Forwarded-For`
+- `X-Forwarded-Host`
+- `X-HTTP-Method-Override`
 
----
+ve benzeri HTTP header'larının **sunucu tarafından yanlış yorumlanması** sonucu oluşan:
 
-## 🎯 Ne İşe Yarar?
+🔹 **Broken Access Control**  
+🔹 **Admin panel bypass**  
+🔹 **Front-end → Back-end URL inconsistency**  
+🔹 **403 bypass**  
+🔹 **Unprotected admin functionality**
 
-`xfcheck` bir URL’ye **GET** ve **POST** isteği atarak şunları kontrol eder:
-
-- X‑Forwarded‑For isteği response’u değiştiriyor mu?
-- X‑Forwarded‑Host isteği response’u değiştiriyor mu?
-- Header değeri response body içinde yansıyor mu?
-- Status code farkı var mı?
-
-Eğer backend bu header’ları işliyorsa **DESTEKLİYOR** olarak işaretler.
-
-Bu, özellikle şu zafiyetlerde işe yarar:
-
-- Access control bypass  
-- IP‑based authentication bypass  
-- Password reset poisoning  
-- Cache poisoning  
-- Host header saldırıları  
-- SSRF varyasyonları  
+gibi kritik güvenlik açıklarını otomatik olarak tespit eder.
 
 ---
 
-## 🚀 Kurulum
+## 🚀 Özellikler
 
-git clone [https://github.com/Songul-Kizilay/xfcheck-.git](https://github.com/Songul-Kizilay/xfcheck.git)
+### ✔ URL Override Detection
+Uygulamanın hangi override header’larını desteklediğini otomatik olarak belirler.
 
-cd xfcheck
+### ✔ SecLists destekli admin path brute-force (Optimize)
+`/usr/share/seclists/Discovery/Web-Content/` dizinindeki wordlistlerde:
 
-chmod +x xfcheck.py
+- admin  
+- panel  
+- dashboard  
+- root  
+- manage  
+- private  
+- console  
+- login  
 
+gibi **anahtar kelime filtrelemesi** yaparak gereksiz girişleri eler ve sadece gerçek admin path'lerini test eder.
 
-Gerekli kütüphane yoksa otomatik yüklenir.
+### ✔ GET & POST Bağımsız Analiz
+Hem GET hem POST isteklerinde override denemesi yapılır.
 
----
+### ✔ Otomatik PortSwigger Login (Opsiyonel)
+`--auto-login` seçeneği ile PortSwigger labları için otomatik giriş yapılır:
 
-## 🧪 Kullanım
+- username: **wiener**
+- password: **peter**
+- CSRF token otomatik çekilir.
 
+### ✔ Otomatik Exploit Modu (Opsiyonel)
+`--auto-exploit` aktif olduğunda araç, override bypass tespitinde otomatik:
 
-
-./xfcheck.py -u https://hedefsite.com/
-
-
-Örnek çıktı:
-
-
-
-[X-Forwarded-For Test]
-GET : DESTEKLİYOR
-POST: DESTEKLİYOR
-
-[X-Forwarded-Host Test]
-GET : Desteklemiyor
-POST: Desteklemiyor
-
-
----
-
-## 🧠 Mantık Nasıl Çalışıyor?
-
-xfcheck şu karşılaştırmayı yapar:
-
-1. Normal GET isteği → status + body
-2. X‑Forwarded header’lı GET isteği → status + body
-3. Fark varsa = destekliyor
-
-Aynısı POST için de yapılır.
-
----
-
-## 🐍 Kodun İçinde Otomatik `requests` Yükleyici Var
-
-Eğer sistemde `requests` yoksa:
-
-
-
-pip install requests
-
-
-komutunu arka planda otomatik çalıştırır.
-
----
-
-## 💡 Not
-
-Bu araç bir **zafiyet tespit aracı değildir**.  
-Sadece uygulamanın ilgili header’ları **işleyip işlemediğini** gösterir.
-
-Geri kalan değerlendirme pentest aşamasına kalır 🙂
-
----
-
-## ✨ Yapan
-
-**Songül Kızılay Özügürler**  
-Security Researcher / Pentester
